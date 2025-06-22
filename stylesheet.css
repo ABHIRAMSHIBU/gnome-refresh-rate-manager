@@ -1,0 +1,31 @@
+/* Add your custom extension styling here */
+
+/* Refresh Profile Extension Styles */
+
+.refresh-profile-status {
+    font-weight: bold;
+    color: #ffffff;
+}
+
+.refresh-profile-status:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Icon styling for different states */
+.system-status-icon.refresh-profile-high {
+    color: #4CAF50; /* Green for high refresh rate */ 
+}
+
+.system-status-icon.refresh-profile-low {
+    color: #FF9800; /* Orange for low refresh rate */
+}
+
+.system-status-icon.refresh-profile-error {
+    color: #F44336; /* Red for error state */
+}
+
+/* Menu item styling */
+.popup-menu-item.refresh-profile-info {
+    font-size: 0.9em;
+    color: #cccccc;
+}

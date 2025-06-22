@@ -1,0 +1,8 @@
+{
+  "name": "Refresh Profile",
+  "description": "Set the refresh rate depending on whether the laptop is plugged in or not.",
+  "uuid": "refreshprofile@abhiram.tuxforums.com",
+  "shell-version": [
+    "48"
+  ]
+}
