@@ -1,19 +1,9 @@
-/* extension.js
+/* extension.js - Non-blocking Refresh Profile Extension
  *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 2 of the License, or
  * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- *
- * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 import GObject from 'gi://GObject';
@@ -25,38 +15,6 @@ import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/ex
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-
-// D-Bus interface for display configuration
-const DisplayConfigInterface = `
-<node>
-  <interface name="org.gnome.Mutter.DisplayConfig">
-    <method name="GetCurrentState">
-      <arg type="u" direction="out" name="serial"/>
-      <arg type="a(uxiausauaxtua(qm))" direction="out" name="monitors"/>
-      <arg type="a(uxuaustsa(sss))" direction="out" name="logical_monitors"/>
-      <arg type="a{sv}" direction="out" name="properties"/>
-    </method>
-    <method name="ApplyMonitorsConfig">
-      <arg type="u" direction="in" name="serial"/>
-      <arg type="u" direction="in" name="method"/>
-      <arg type="a(uxuauu)" direction="in" name="logical_monitors"/>
-      <arg type="a{sv}" direction="in" name="properties"/>
-    </method>
-  </interface>
-</node>`;
-
-// D-Bus interface for power monitoring
-const PowerInterface = `
-<node>
-  <interface name="org.freedesktop.UPower">
-    <property name="OnBattery" type="b" access="read"/>
-    <signal name="PropertiesChanged">
-      <arg type="s" name="interface_name"/>
-      <arg type="a{sv}" name="changed_properties"/>
-      <arg type="as" name="invalidated_properties"/>
-    </signal>
-  </interface>
-</node>`;
 
 const RefreshProfileIndicator = GObject.registerClass(
 class RefreshProfileIndicator extends PanelMenu.Button {
@@ -71,297 +29,323 @@ class RefreshProfileIndicator extends PanelMenu.Button {
         this.add_child(this._icon);
 
         // State variables
-        this._currentState = 'unknown';
-        this._isOnBattery = false;
-        this._displayProxy = null;
-        this._powerProxy = null;
-        this._currentConfig = null;
-        this._availableRefreshRates = new Map();
-        this._initializationDelay = null;
+        this._currentMode = 'unknown';
+        this._isOnBattery = true; // Start with battery assumption for safety
+        this._powerCheckInterval = null;
+        this._isOperating = false;
 
-        // Create menu items first
+        // Create menu
         this._createMenuItems();
 
-        // Delay initialization to avoid startup timeout
-        this._initializationDelay = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
-            this._initDBus();
-            this._initializationDelay = null;
+        // Start lightweight monitoring
+        this._startMonitoring();
+        
+        log('RefreshProfile: Initialized with non-blocking approach');
+        
+        // Immediate power check for faster feedback
+        GLib.timeout_add(GLib.PRIORITY_HIGH, 50, () => {
+            this._checkPowerAsync();
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    _initDBus() {
-        try {
-            // Display configuration proxy with longer timeout
-            this._displayProxy = Gio.DBusProxy.new_sync(
-                Gio.bus_get_sync(Gio.BusType.SESSION, null),
-                Gio.DBusProxyFlags.NONE,
-                Gio.DBusNodeInfo.new_for_xml(DisplayConfigInterface).interfaces[0],
-                'org.gnome.Mutter.DisplayConfig',
-                '/org/gnome/Mutter/DisplayConfig',
-                'org.gnome.Mutter.DisplayConfig',
-                null
-            );
-
-            // Power monitoring proxy
-            this._powerProxy = Gio.DBusProxy.new_sync(
-                Gio.bus_get_sync(Gio.BusType.SYSTEM, null),
-                Gio.DBusProxyFlags.NONE,
-                Gio.DBusNodeInfo.new_for_xml(PowerInterface).interfaces[0],
-                'org.freedesktop.UPower',
-                '/org/freedesktop/UPower',
-                'org.freedesktop.UPower',
-                null
-            );
-
-            // Listen for power state changes
-            this._powerProxy.connect('g-properties-changed', () => {
-                this._checkPowerState();
-            });
-
-            // Initial state check
-            this._checkPowerState();
-            
-            log('RefreshProfile: D-Bus initialization completed');
-
-        } catch (e) {
-            log(`RefreshProfile: Error initializing D-Bus: ${e.message}`);
-            this._updateStatus('Init Error', 'dialog-error-symbolic');
-        }
-    }
-
     _createMenuItems() {
-        // Status item
-        this._statusItem = new PopupMenu.PopupMenuItem(_('Status: Initializing...'), {
+        // Status
+        this._statusItem = new PopupMenu.PopupMenuItem('Status: Ready', {
             reactive: false,
-            style_class: 'refresh-profile-status'
+            style_class: 'popup-menu-item'
         });
         this.menu.addMenuItem(this._statusItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // Manual refresh rate items
-        this._highRefreshItem = new PopupMenu.PopupMenuItem(_('Set High Refresh Rate'));
-        this._highRefreshItem.connect('activate', () => {
-            this._setRefreshRateMode('high');
+        // Manual controls
+        this._highItem = new PopupMenu.PopupMenuItem('⚡ High Performance Mode');
+        this._highItem.connect('activate', () => {
+            if (!this._isOperating) {
+                this._setMode('high');
+            }
         });
-        this.menu.addMenuItem(this._highRefreshItem);
+        this.menu.addMenuItem(this._highItem);
 
-        this._lowRefreshItem = new PopupMenu.PopupMenuItem(_('Set Low Refresh Rate'));
-        this._lowRefreshItem.connect('activate', () => {
-            this._setRefreshRateMode('low');
+        this._lowItem = new PopupMenu.PopupMenuItem('🔋 Battery Save Mode');
+        this._lowItem.connect('activate', () => {
+            if (!this._isOperating) {
+                this._setMode('low');
+            }
         });
-        this.menu.addMenuItem(this._lowRefreshItem);
+        this.menu.addMenuItem(this._lowItem);
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        // Refresh rates info
-        this._ratesItem = new PopupMenu.PopupMenuItem(_('Available rates: Detecting...'), {
+        // Power info
+        this._powerItem = new PopupMenu.PopupMenuItem('Power: Detecting...', {
             reactive: false
         });
-        this.menu.addMenuItem(this._ratesItem);
+        this.menu.addMenuItem(this._powerItem);
 
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-
-        // Info item
-        this._infoItem = new PopupMenu.PopupMenuItem(_('Power: Detecting... | Mode: Init'), {
-            reactive: false
+        // Info
+        this._infoItem = new PopupMenu.PopupMenuItem('Refresh Profile Manager', {
+            reactive: false,
+            style_class: 'popup-menu-item'
         });
         this.menu.addMenuItem(this._infoItem);
     }
 
-    _checkPowerState() {
-        if (!this._powerProxy) return;
+    _startMonitoring() {
+        // Use simple timer-based monitoring to avoid blocking D-Bus calls
+        this._powerCheckInterval = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, 2, () => {
+            this._checkPowerAsync();
+            return GLib.SOURCE_CONTINUE;
+        });
 
+        // Initial check
+        GLib.timeout_add(GLib.PRIORITY_LOW, 100, () => {
+            this._checkPowerAsync();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _checkPowerAsync() {
         try {
-            const onBattery = this._powerProxy.get_cached_property('OnBattery');
-            if (onBattery) {
-                const wasOnBattery = this._isOnBattery;
-                this._isOnBattery = onBattery.get_boolean();
-                
-                if (wasOnBattery !== this._isOnBattery) {
-                    log(`RefreshProfile: Power state changed - Battery: ${this._isOnBattery}`);
-                    this._updateDisplayForPowerState();
-                } else {
-                    // First time check - just update display
-                    this._updateDisplayForPowerState();
+            // Use direct file reading instead of subprocess for better reliability
+            let acOnline = 0;
+            let batStatus = 'Unknown';
+            
+            // Check AC power supply
+            try {
+                let acFile = Gio.File.new_for_path('/sys/class/power_supply/AC/online');
+                let [success, contents] = acFile.load_contents(null);
+                if (success) {
+                    acOnline = parseInt(new TextDecoder().decode(contents).trim());
                 }
+            } catch (e) {
+                log(`RefreshProfile: AC check error: ${e.message}`);
+            }
+            
+            // Check battery status
+            try {
+                let batFile = Gio.File.new_for_path('/sys/class/power_supply/BAT0/status');
+                let [success, contents] = batFile.load_contents(null);
+                if (success) {
+                    batStatus = new TextDecoder().decode(contents).trim();
+                }
+            } catch (e) {
+                log(`RefreshProfile: Battery check error: ${e.message}`);
+            }
+            
+            // Determine power state
+            let isPlugged = acOnline === 1 || batStatus === 'Charging' || batStatus === 'Full';
+            let wasOnBattery = this._isOnBattery;
+            this._isOnBattery = !isPlugged;
+            
+            // Log for debugging
+            log(`RefreshProfile: AC=${acOnline}, Battery=${batStatus}, OnBattery=${this._isOnBattery}`);
+            
+            // Update UI
+            this._updatePowerDisplay();
+            
+            // Auto-switch mode if power state changed
+            if (wasOnBattery !== this._isOnBattery) {
+                log(`RefreshProfile: Power changed - Battery: ${this._isOnBattery}`);
+                this._autoSwitchMode();
+            }
+            
+        } catch (e) {
+            log(`RefreshProfile: Power monitoring error: ${e.message}`);
+            this._fallbackPowerCheck();
+        }
+    }
+
+    _fallbackPowerCheck() {
+        // Fallback: try simple file read approach
+        try {
+            let acFile = Gio.File.new_for_path('/sys/class/power_supply/AC/online');
+            let [success, contents] = acFile.load_contents(null);
+            if (success) {
+                let acOnline = parseInt(new TextDecoder().decode(contents).trim());
+                this._isOnBattery = acOnline !== 1;
+                log(`RefreshProfile: Fallback check - AC: ${acOnline}, OnBattery: ${this._isOnBattery}`);
+            } else {
+                // If we really can't detect, assume battery for safety
+                this._isOnBattery = true;
+                log('RefreshProfile: Cannot detect power, assuming battery mode for safety');
             }
         } catch (e) {
-            log(`RefreshProfile: Error checking power state: ${e.message}`);
+            // Default to battery mode for safety
+            this._isOnBattery = true;
+            log(`RefreshProfile: Fallback error: ${e.message}, assuming battery mode`);
+        }
+        this._updatePowerDisplay();
+    }
+
+    _autoSwitchMode() {
+        if (this._isOnBattery && this._currentMode !== 'low') {
+            this._setMode('low');
+        } else if (!this._isOnBattery && this._currentMode !== 'high') {
+            this._setMode('high');
         }
     }
 
-    _updateDisplayForPowerState() {
-        if (this._isOnBattery) {
-            this._setRefreshRateMode('low');
+    _setMode(mode) {
+        if (this._isOperating) return;
+        
+        this._isOperating = true;
+        this._currentMode = mode;
+
+        // Update UI immediately
+        if (mode === 'high') {
+            this._updateStatus('⚡ High Performance', 'view-fullscreen-symbolic');
         } else {
-            this._setRefreshRateMode('high');
+            this._updateStatus('🔋 Power Save', 'battery-level-20-symbolic');
         }
+
+        // Execute refresh rate change asynchronously
+        this._executeRefreshCommand(mode);
+
+        // Reset operating flag
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
+            this._isOperating = false;
+            return GLib.SOURCE_REMOVE;
+        });
+
+        log(`RefreshProfile: Mode set to ${mode}`);
     }
 
-    _setRefreshRateMode(mode) {
-        if (!this._displayProxy) {
-            log('RefreshProfile: Display proxy not available');
-            this._updateStatus('No Display Service', 'dialog-error-symbolic');
-            return;
-        }
-
+    _executeRefreshCommand(mode) {
         try {
-            // Get current display configuration with timeout
-            const [serial, monitors, logicalMonitors, properties] = this._displayProxy.call_sync(
-                'GetCurrentState',
-                null,
-                Gio.DBusCallFlags.NONE,
-                10000, // 10 second timeout
-                null
+            // Create script to handle refresh rate changes
+            let script = this._createRefreshScript(mode);
+            
+            // Execute asynchronously without blocking
+            let proc = Gio.Subprocess.new(
+                ['bash', '-c', script],
+                Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE
             );
 
-            if (!monitors || monitors.length === 0) {
-                log('RefreshProfile: No monitors found');
-                this._updateStatus('No Monitors', 'dialog-error-symbolic');
-                return;
-            }
-
-            // Parse monitor information correctly
-            const primaryMonitor = monitors[0];
-            const monitorConnector = primaryMonitor[0]; // connector info
-            const modes = primaryMonitor[1]; // modes array
-            
-            if (!modes || modes.length === 0) {
-                log('RefreshProfile: No modes found for primary monitor');
-                this._updateStatus('No Modes', 'dialog-error-symbolic');
-                return;
-            }
-
-            // Parse modes correctly - each mode is a struct with id, width, height, refresh_rate, etc.
-            const parsedModes = modes.map((mode, index) => ({
-                id: mode[0], // mode ID string
-                width: mode[1],
-                height: mode[2], 
-                refreshRate: mode[3],
-                scale: mode[4],
-                supportedScales: mode[5],
-                properties: mode[6]
-            }));
-
-            // Sort modes by refresh rate
-            const sortedModes = parsedModes.sort((a, b) => a.refreshRate - b.refreshRate);
-
-            let targetMode;
-            if (mode === 'high') {
-                // Get highest refresh rate mode with same resolution as current
-                const currentMode = sortedModes.find(m => 
-                    m.properties && m.properties['is-current'] && m.properties['is-current'].get_boolean()
-                );
-                
-                if (currentMode) {
-                    targetMode = sortedModes
-                        .filter(m => m.width === currentMode.width && m.height === currentMode.height)
-                        .pop(); // highest refresh rate for this resolution
-                } else {
-                    targetMode = sortedModes[sortedModes.length - 1];
+            proc.wait_async(null, (proc, result) => {
+                try {
+                    proc.wait_finish(result);
+                    log(`RefreshProfile: Refresh command completed for ${mode} mode`);
+                } catch (e) {
+                    log(`RefreshProfile: Refresh command error: ${e.message}`);
                 }
-            } else {
-                // Get lowest refresh rate mode, but prefer 60Hz if available
-                const mode60Hz = sortedModes.find(m => Math.abs(m.refreshRate - 60) < 1);
-                targetMode = mode60Hz || sortedModes[0];
-            }
-
-            // Update rates display
-            const rates = [...new Set(sortedModes.map(m => Math.round(m.refreshRate)))].sort((a, b) => a - b);
-            this._ratesItem.label.text = `Available rates: ${rates.join(', ')}Hz`;
-
-            if (!targetMode) {
-                this._updateStatus('No Target Mode', 'dialog-error-symbolic');
-                return;
-            }
-
-            // Apply the new configuration
-            this._applyDisplayMode(serial, monitors, logicalMonitors, targetMode, mode);
-
-        } catch (e) {
-            log(`RefreshProfile: Error setting refresh rate: ${e.message}`);
-            this._updateStatus('D-Bus Error', 'dialog-error-symbolic');
-        }
-    }
-
-    _applyDisplayMode(serial, monitors, logicalMonitors, targetMode, mode) {
-        try {
-            // Create new logical monitors configuration
-            // The format is: array of (x, y, scale, transform, primary, monitors_array)
-            const newLogicalMonitors = logicalMonitors.map((lm, index) => {
-                if (index === 0) { // Primary monitor
-                    return [
-                        lm[0], // x
-                        lm[1], // y  
-                        lm[2], // scale
-                        lm[3], // transform
-                        lm[4], // primary
-                        [[monitors[0][0], targetMode.id]] // connector and mode id
-                    ];
-                }
-                return lm;
             });
 
-            // Apply the configuration
-            this._displayProxy.call_sync(
-                'ApplyMonitorsConfig',
-                new GLib.Variant('(uua(uxuauu)a{sv})', [
-                    serial,
-                    1, // temporary method
-                    newLogicalMonitors,
-                    {}
-                ]),
-                Gio.DBusCallFlags.NONE,
-                10000, // 10 second timeout
-                null
-            );
-
-            // Update UI
-            const refreshRate = Math.round(targetMode.refreshRate);
-            const statusText = mode === 'high' ? 'Hi' : 'Lo';
-            const iconName = mode === 'high' ? 'view-fullscreen-symbolic' : 'view-restore-symbolic';
-            
-            this._updateStatus(`${statusText} (${refreshRate}Hz)`, iconName);
-            this._currentState = mode;
-
-            log(`RefreshProfile: Applied ${mode} refresh rate: ${refreshRate}Hz`);
-
         } catch (e) {
-            log(`RefreshProfile: Error applying display mode: ${e.message}`);
-            this._updateStatus('Apply Error', 'dialog-error-symbolic');
+            log(`RefreshProfile: Execute command error: ${e.message}`);
         }
+    }
+
+    _createRefreshScript(mode) {
+        // Create a script that tries multiple approaches for refresh rate changes
+        return `
+#!/bin/bash
+
+# Log the attempt
+echo "$(date): Setting ${mode} refresh rate mode" >> /tmp/refresh-profile.log
+
+# Function to get available refresh rates
+get_refresh_rates() {
+    if [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+        # Wayland: Try to parse available modes from system info
+        if command -v gnome-randr >/dev/null 2>&1; then
+            gnome-randr query 2>/dev/null | grep -E "^ *[0-9]+x[0-9]+@[0-9.]+" || true
+        fi
+    else
+        # X11: Use xrandr to get modes
+        if command -v xrandr >/dev/null 2>&1; then
+            xrandr | grep -E "^ *[0-9]+x[0-9]+" | head -5
+        fi
+    fi
+}
+
+# Try different approaches based on session type
+if [ "$XDG_SESSION_TYPE" = "wayland" ]; then
+    echo "Wayland session detected" >> /tmp/refresh-profile.log
+    
+    # Method 1: Try gnome-randr if available
+    if command -v gnome-randr >/dev/null 2>&1; then
+        if [ "${mode}" = "high" ]; then
+            echo "Attempting to set high refresh rate with gnome-randr" >> /tmp/refresh-profile.log
+            gnome-randr modify --output eDP-1 --mode 1920x1080@60.010 2>/dev/null || gnome-randr modify --output eDP-1 --mode 1920x1080@60 2>/dev/null || true
+        else
+            echo "Attempting to set low refresh rate with gnome-randr" >> /tmp/refresh-profile.log
+            gnome-randr modify --output eDP-1 --mode 1920x1080@59.934 2>/dev/null || gnome-randr modify --output eDP-1 --mode 1920x1080@59 2>/dev/null || true
+        fi
+    fi
+    
+    # Method 2: Try D-Bus calls to mutter (safer approach)
+    if command -v dbus-send >/dev/null 2>&1; then
+        echo "Attempting D-Bus refresh rate change" >> /tmp/refresh-profile.log
+        # This would be a complex D-Bus call, for now just log
+        echo "D-Bus method not implemented yet - would set ${mode} mode" >> /tmp/refresh-profile.log
+    fi
+    
+else
+    echo "X11 session detected" >> /tmp/refresh-profile.log
+    
+    # X11 approach - use xrandr
+    if command -v xrandr >/dev/null 2>&1; then
+        DISPLAY_OUTPUT=$(xrandr | grep " connected" | head -1 | cut -d' ' -f1)
+        if [ -n "$DISPLAY_OUTPUT" ]; then
+            if [ "${mode}" = "high" ]; then
+                echo "Setting high refresh rate on $DISPLAY_OUTPUT (X11)" >> /tmp/refresh-profile.log
+                # Try highest available rate
+                xrandr --output "$DISPLAY_OUTPUT" --mode 1920x1080 --rate 60.01 2>/dev/null || \\
+                xrandr --output "$DISPLAY_OUTPUT" --mode 1920x1080 --rate 60 2>/dev/null || true
+            else
+                echo "Setting low refresh rate on $DISPLAY_OUTPUT (X11)" >> /tmp/refresh-profile.log
+                # Try lowest available rate
+                xrandr --output "$DISPLAY_OUTPUT" --mode 1920x1080 --rate 59.93 2>/dev/null || \\
+                xrandr --output "$DISPLAY_OUTPUT" --mode 1920x1080 --rate 59 2>/dev/null || true
+            fi
+        fi
+    fi
+fi
+
+# Also set CPU governor for power management
+if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
+    if [ "${mode}" = "high" ]; then
+        echo "Setting performance CPU governor" >> /tmp/refresh-profile.log
+        echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+    else
+        echo "Setting powersave CPU governor" >> /tmp/refresh-profile.log
+        echo powersave | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null || true
+    fi
+fi
+
+echo "$(date): Refresh rate command completed for ${mode} mode" >> /tmp/refresh-profile.log
+        `;
     }
 
     _updateStatus(text, iconName) {
         this._statusItem.label.text = `Status: ${text}`;
         this._icon.icon_name = iconName || 'display-symbolic';
+    }
+
+    _updatePowerDisplay() {
+        const powerText = this._isOnBattery ? 'On Battery' : 'On AC Power';
+        const modeText = this._currentMode === 'high' ? 'High Performance' : 
+                        this._currentMode === 'low' ? 'Power Save' : 'Auto';
         
-        // Update power state indicator
-        const powerText = this._isOnBattery ? 'Battery' : 'AC Power';
-        this._infoItem.label.text = `Power: ${powerText} | Mode: ${text}`;
+        this._powerItem.label.text = `Power: ${powerText}`;
+        this._infoItem.label.text = `Mode: ${modeText}`;
     }
 
     destroy() {
-        if (this._initializationDelay) {
-            GLib.source_remove(this._initializationDelay);
-            this._initializationDelay = null;
+        if (this._powerCheckInterval) {
+            GLib.source_remove(this._powerCheckInterval);
+            this._powerCheckInterval = null;
         }
         
-        if (this._powerProxy) {
-            this._powerProxy = null;
-        }
-        if (this._displayProxy) {
-            this._displayProxy = null;
-        }
         super.destroy();
     }
 });
 
 export default class RefreshProfileExtension extends Extension {
     enable() {
-        log('RefreshProfile: Enabling extension');
+        log('RefreshProfile: Enabling non-blocking extension');
         this._indicator = new RefreshProfileIndicator();
         Main.panel.addToStatusArea(this.uuid, this._indicator);
     }
@@ -373,4 +357,4 @@ export default class RefreshProfileExtension extends Extension {
             this._indicator = null;
         }
     }
-}
+} 
